@@ -1,0 +1,204 @@
+
+Build Root section
+--------------------------------------------------------
+# create a directory called riscv
+mkdir riscv
+
+# download buildroot into riscv from https://buildroot.org
+wget https://buildroot.org/downloads/buildroot-2024.05.1.tar.gz
+
+# extract and go into buildroot directory
+
+# run
+make menuconfig
+	-> target options -> Target Architecture, choose RISCV
+	-> Toolchain -> C library, choose musl
+
+# save your configuration and run
+make sdk
+
+# at the end of make sdk, you will have a toolchain archive in
+	output/images/riscv64-buildroot-linux-musl-sdk-buildroot.tar.gz
+
+# extract the archive in a suitable directory, and in the extracted
+# directory, run
+	./relocate-sdk.sh
+
+# Create script file to setup your riscv64 environment variables
+vi riscv64-env.sh
+	export PATH=$HOME/toolchain/riscv64-buildroot-linux-musl_sdk-buildroot/bin/:$PATH
+	export CROSS_COMPILE=riscv65-linux-
+	export ARCH=riscv
+
+source riscv64-env.sh
+
+# test a simple hello world
+# compile and test the riscv64 compiler
+riscv64-linux-gcc -static -o hello hello.c
+
+# test it in a risv64 environment using qemu
+qemu-riscv64 hello
+
+
+U-BOOT section
+------------------------------------------
+# Download u-boot source code
+	wget https://ftp-denx.de/pub/u-boot/u-boot-2021.01.tar.gz
+# for the latest use the following instead
+	wget https://source.denx.de/u-boot/u-boot.git
+
+# make sure you ran the environment script so the variables will
+# be setup for cross-compiling: 
+source riscv64-env.sh
+
+# CROSS_COMPILE is the cross-compiler prefix, as out cross-compiler is riscv64-linux-
+#	example command riscv64-linux-gcc
+#
+# Find U-Boot read-made configurations for RISC-V:
+
+ls configs | grep riscv
+
+# we will choose the configuration for QEMU and U-Boot running in S Mode:
+
+make qemu-riscv64_smode_defconfig
+
+# if you want u-boot to be able to read and write to a fat partition
+# then you need to do a
+make menuconfig
+	CONFIG_ENV_IS_IN_FAT=y
+	CONFIG_ENV_FAT_INTERFACE="virtio"
+	CONFIG_ENV_FAT_DEVICE_AND_PART="0:1"
+
+# Now lets compile U-Boot (-j8: 8 jobs compile jobs in parallel)
+
+make -j8
+
+
+Firmware
+----------------------------------------------
+# Required to start an OS (S mode) from the Supervisor/Firmware (M mode)
+
+git clone https://github.com/riscv/opensbi.git
+cd opensbi
+# for a specific version perform a checkout
+git checkout v0.8
+# to build opensbi with the u-boot you previously built
+#    use ../u-boot-<version you are using>/u-boot.bin
+make PLATFORM=generic FW_PAYLOAD_PATH=../u-boot-2021.01/u-boot.bin
+
+# run the above command every time you update U-Boot
+
+# This generates the build/platform/generic/firmware/fw_payload.elf file
+# which is a binary the QEMU can boot.
+
+
+Starting U-Boot in QEMU
+---------------------------------------------------
+
+qemu-system-riscv64 -m 2G -nographic -machine virt -smp 4 \
+	-bios opensbi/build/platform/generic/firmware/fw_payload.elf
+
+# to exit QEMU with [Ctrl][a] followed by [x]
+
+
+Kernel building
+---------------------------------------------------
+# Download Linux-6.10.2.tar.gz kernel source code
+wget https://kernel.org/pub/linux/kernel/v6.x/linux-6.10.2.tar.gz
+
+# make sure you already ran the cross-compile environment
+	source riscv64-env.sh
+
+# lets use the default linux kernel configuration for RISCV
+make help | grep defconfig
+
+make defconfig
+
+# we can now further customize the linux kernel configuration
+make menuconfig
+
+# to make the kernel type in to build it faster use -j<jobs> option
+# <jobs> is the number of job processes that your system can run with
+make
+
+# to compile even faster using cache
+make -j 8  CC="ccache riscv64-linux-gcc"
+
+# at the end of the build you will have vmlinux or the raw kernel in elf format
+# arch/riscv/boot/Image which is an uncompressed bootable kernel
+# arch/riscv/boot/Image.gz which is a compressed bootable kernel
+
+
+Booting the linux kernel directly (combined with opensbi)
+-----------------------------------------------------------
+# we could boot the linux kernel directly as part of opensbi
+# instead of opensbi being combined with u-boot, you can combine
+# opensbi with the linux kernel instead.
+
+cd opensbi
+make PLATFORM=generic FW_PAYLOAD_PATH=../linux-6.10.2/arch/riscv/boot/Image
+cd ..
+
+# then use qemu to boot both the firmware and kernel using qemu bios option
+qemu-system-riscv64 -m 2G -nographic -machine virt -smp 4 \
+	-bios opensbi/build/platform/generic/firmware/fw_payload.elf \
+	-append "console=ttyS0" \
+	.....
+
+
+Booting the linux kernel with an environment
+-----------------------------------------------------------
+# create a disk for qemu, so lets create a 128 MB disk image
+dd if=/dev/zero of=disk.img bs=1M count=128
+
+# now create 2 partitions for that disk.img
+# the first partition with be a 64MB primary partition (type W95 FAT32 (LBA))
+# the second partition will be the remaining space as (type Linux)
+cfdisk disk.img
+
+# To verify type in the following
+fdisk -l disk.img
+
+# using a loop back device we will add the 2 partitions so the
+# system can see those 2 disk.img partitions
+sudo losetup -f --show --partscan disk.img /dev/loop2
+
+# to see if two new /dev/loop2xx devices were created run the following
+ls -la /dev/loop2*
+
+# now we need to format those two partitions, type in the following:
+mkfs.vfat -F 32 -n boot /dev/loop2p1
+mkfs.ext4 -L rootfs /dev/loop2p2
+
+# now create a mount point directory for the fat partition, or the first
+# partition within the disk.img file
+mkdir boot
+
+# now mount the /dev/loop2p1 partition to the new mount point that
+# was previously created.  This is where we want to save the kernel image
+sudo mount /dev/loop2p1 boot
+
+# copy over the kernel image 
+cp linux-6.10.2/arch/riscv/boot/Image boot
+
+# now umount the loop back boot partition
+sudo umount boot
+
+
+# add a disk to the emulated machine
+qemu-system-riscv64 -m 2G -nographic -machine virt -smp 4 \
+	-bios opensbi/build/platform/generic/firmware/fw_payload.elf \
+	-drive file=disk.img,format.raw,id=hd0 \
+	-device virtio-blk-device,drive=hd0
+
+# in u-boot you should now be able to save an environment
+setenv foo bar
+saveenv
+# to check if the data is saved, you can run the following u-boot command:
+fatls virtio 0:1
+
+# reboot qemu again and the foo variable should still be there
+printenv foo
+
+
+
